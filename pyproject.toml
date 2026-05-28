@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oscar-transformers"
+version = "0.0.1"
+description = "OSCAR 2-bit KV cache quantization for transformers.cache_utils.Cache"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "James Burton" }]
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.3",
+  "transformers>=4.43",
+  "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["oscar_transformers"]

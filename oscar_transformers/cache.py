@@ -1,0 +1,218 @@
+"""`transformers.cache_utils.Cache` subclass implementing OSCAR's mixed
+sink + INT2 middle + recent KV cache.
+
+The cache assumes the model has already had K/V projections rotated via
+:func:`oscar_transformers.rotation.bake_rotations` (the default "baked" mode).
+A debug-only "online" mode is available via :mod:`oscar_transformers._online`.
+
+Layout per layer
+----------------
+
+Each :class:`OSCARCacheLayer` keeps three regions:
+
+- **sink** (first ``sink_tokens`` tokens, default 64): full-precision K, V.
+- **recent** (last ``recent_tokens`` tokens, default 256): full-precision K, V.
+- **middle** (everything in between): per-token group-128 asymmetric INT2,
+  with separate K/V clip ratios.
+
+As new tokens stream in via :meth:`update`, the recent window fills FIFO; once
+it exceeds ``recent_tokens`` the oldest recent tokens are quantized and
+appended to the middle region. The sink region never changes after the first
+``sink_tokens`` tokens are written.
+
+The cache is *not* compatible with :meth:`Cache.crop` (used by the parent
+delta-mem-tests runner for cross-question reuse). Crop is disabled for
+non-bf16 backends in ``run/_chunked_eval_runner.py``; OSCAR is no exception.
+"""
+from __future__ import annotations
+
+from typing import Any, List, Optional, Tuple
+
+import torch
+from transformers.cache_utils import Cache, CacheLayerMixin
+
+from .quantize import QuantizedBlock, concat_blocks, dequantize, quantize_per_token
+
+
+class OSCARCacheLayer(CacheLayerMixin):
+    """Per-layer OSCAR cache. See :class:`OSCARCache` for context."""
+
+    is_sliding = False
+
+    def __init__(
+        self,
+        *,
+        sink_tokens: int = 64,
+        recent_tokens: int = 256,
+        bits: int = 2,
+        group_size: int = 128,
+        k_clip: float = 0.96,
+        v_clip: float = 0.92,
+    ) -> None:
+        super().__init__()
+        self.sink_tokens = int(sink_tokens)
+        self.recent_tokens = int(recent_tokens)
+        self.bits = int(bits)
+        self.group_size = int(group_size)
+        self.k_clip = float(k_clip)
+        self.v_clip = float(v_clip)
+        self.is_initialized = False
+        self.dtype: Optional[torch.dtype] = None
+        self.device: Optional[torch.device] = None
+        self.sink_k: Optional[torch.Tensor] = None
+        self.sink_v: Optional[torch.Tensor] = None
+        self.middle_k: Optional[QuantizedBlock] = None
+        self.middle_v: Optional[QuantizedBlock] = None
+        self.recent_k: Optional[torch.Tensor] = None
+        self.recent_v: Optional[torch.Tensor] = None
+
+    def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.dtype = key_states.dtype
+        self.device = key_states.device
+        self.is_initialized = True
+
+    def get_seq_length(self) -> int:
+        if not self.is_initialized:
+            return 0
+        return (
+            (0 if self.sink_k is None else self.sink_k.shape[2])
+            + (0 if self.middle_k is None else self.middle_k.codes.shape[2])
+            + (0 if self.recent_k is None else self.recent_k.shape[2])
+        )
+
+    def get_max_cache_shape(self) -> int:
+        return -1
+
+    def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
+        kv_length = self.get_seq_length() + query_length
+        return kv_length, 0
+
+    def reset(self) -> None:
+        self.is_initialized = False
+        self.sink_k = self.sink_v = None
+        self.middle_k = self.middle_v = None
+        self.recent_k = self.recent_v = None
+
+    def reorder_cache(self, beam_idx: torch.Tensor) -> None:
+        raise NotImplementedError("OSCARCacheLayer does not support beam search yet.")
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Append ``key_states, value_states`` and return the assembled
+        (sink + middle dequant + recent) K, V slabs.
+
+        ``key_states`` and ``value_states`` arrive shaped
+        ``(batch, num_kv_heads, new_tokens, head_dim)`` already in the rotated
+        basis (because the model was passed through :func:`bake_rotations`).
+        """
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+
+        n_new = key_states.shape[2]
+        offset = 0
+
+        sink_have = 0 if self.sink_k is None else self.sink_k.shape[2]
+        sink_remaining = self.sink_tokens - sink_have
+        if sink_remaining > 0 and n_new > 0:
+            take = min(sink_remaining, n_new)
+            new_sink_k = key_states[:, :, offset:offset + take, :]
+            new_sink_v = value_states[:, :, offset:offset + take, :]
+            self.sink_k = new_sink_k if self.sink_k is None else torch.cat([self.sink_k, new_sink_k], dim=2)
+            self.sink_v = new_sink_v if self.sink_v is None else torch.cat([self.sink_v, new_sink_v], dim=2)
+            offset += take
+
+        if offset < n_new:
+            new_recent_k = key_states[:, :, offset:, :]
+            new_recent_v = value_states[:, :, offset:, :]
+            self.recent_k = new_recent_k if self.recent_k is None else torch.cat([self.recent_k, new_recent_k], dim=2)
+            self.recent_v = new_recent_v if self.recent_v is None else torch.cat([self.recent_v, new_recent_v], dim=2)
+
+        if self.recent_k is not None and self.recent_k.shape[2] > self.recent_tokens:
+            overflow = self.recent_k.shape[2] - self.recent_tokens
+            spill_k = self.recent_k[:, :, :overflow, :]
+            spill_v = self.recent_v[:, :, :overflow, :]
+            self.recent_k = self.recent_k[:, :, overflow:, :]
+            self.recent_v = self.recent_v[:, :, overflow:, :]
+
+            quant_k = quantize_per_token(
+                spill_k, bits=self.bits, group_size=self.group_size, clip_ratio=self.k_clip,
+            )
+            quant_v = quantize_per_token(
+                spill_v, bits=self.bits, group_size=self.group_size, clip_ratio=self.v_clip,
+            )
+            self.middle_k = quant_k if self.middle_k is None else concat_blocks((self.middle_k, quant_k))
+            self.middle_v = quant_v if self.middle_v is None else concat_blocks((self.middle_v, quant_v))
+
+        return self._assemble()
+
+    def _assemble(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        dtype = self.dtype or torch.bfloat16
+        parts_k: List[torch.Tensor] = []
+        parts_v: List[torch.Tensor] = []
+        if self.sink_k is not None:
+            parts_k.append(self.sink_k)
+            parts_v.append(self.sink_v)
+        if self.middle_k is not None:
+            parts_k.append(dequantize(self.middle_k, dtype=dtype))
+            parts_v.append(dequantize(self.middle_v, dtype=dtype))
+        if self.recent_k is not None:
+            parts_k.append(self.recent_k)
+            parts_v.append(self.recent_v)
+        if not parts_k:
+            empty = torch.empty(0, device=self.device or "cpu")
+            return empty, empty
+        return torch.cat(parts_k, dim=2), torch.cat(parts_v, dim=2)
+
+
+class OSCARCache(Cache):
+    """OSCAR mixed-precision KV cache.
+
+    Parameters
+    ----------
+    config:
+        The model's config (any object with ``num_hidden_layers``).
+    sink_tokens:
+        Number of leading tokens kept in full precision. Default 64 matches
+        RotationZoo / sglang ``SGLANG_MIXED_KV_PREFIX_TOKENS=64``.
+    recent_tokens:
+        Number of trailing tokens kept in full precision. Default 256 matches
+        ``SGLANG_MIXED_KV_RECENT_TOKENS=256``.
+    bits:
+        INT bits for the middle region. Default 2.
+    group_size:
+        Quantization group size along head_dim. Default 128.
+    k_clip:
+        Clip ratio for K quantization. Default 0.96 (RotationZoo).
+    v_clip:
+        Clip ratio for V quantization. Default 0.92 (RotationZoo).
+    """
+
+    def __init__(
+        self,
+        *,
+        config: Any,
+        sink_tokens: int = 64,
+        recent_tokens: int = 256,
+        bits: int = 2,
+        group_size: int = 128,
+        k_clip: float = 0.96,
+        v_clip: float = 0.92,
+    ) -> None:
+        n_layers = int(getattr(config, "num_hidden_layers"))
+        layers = [
+            OSCARCacheLayer(
+                sink_tokens=sink_tokens,
+                recent_tokens=recent_tokens,
+                bits=bits,
+                group_size=group_size,
+                k_clip=k_clip,
+                v_clip=v_clip,
+            )
+            for _ in range(n_layers)
+        ]
+        super().__init__(layers=layers)

@@ -1,0 +1,26 @@
+oscar-transformers
+==================
+
+A port of the OSCAR (Offline Spectral Covariance-Aware Rotation) 2-bit KV cache
+quantization algorithm into the `transformers.cache_utils.Cache` API surface so
+it can be used with stock Hugging Face transformers models without depending on
+SGLang.
+
+Upstream
+--------
+
+The algorithm, the offline 3-phase calibration pipeline, the rotation file
+format, and the INT2 attention kernel come from:
+
+  OSCAR: Offline Spectral Covariance-Aware Rotation for 2-bit KV Cache
+  Quantization
+  Paper:   https://arxiv.org/abs/2605.17757
+  Code:    https://github.com/FutureMLS-Lab/OSCAR  (MIT)
+  Website: https://oscar-quantize.github.io/
+  Rotations (RotationZoo): https://huggingface.co/Zhongzhu/OSCAR-RotationZoo
+
+This package is an independent re-implementation of the OSCAR math against the
+Hugging Face transformers `Cache` API; it does not vendor any code from the
+upstream repository. Credit for the algorithm and the calibrated rotation
+matrices belongs to the OSCAR authors. This port is released under the MIT
+license; see LICENSE.
