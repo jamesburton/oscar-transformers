@@ -1,15 +1,15 @@
-"""Rotation loader + bake_rotations smoke tests using a tiny stub model."""
+"""Rotation loader + apply_rotations smoke tests."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 import torch
-from torch import nn
 
 from oscar_transformers.rotation import (
     LayerRotation,
     RotationSet,
+    apply_rotations,
     bake_rotations,
     load_rotation_file,
 )
@@ -51,85 +51,117 @@ def test_load_rotation_file_roundtrip(tmp_path: Path) -> None:
     assert torch.allclose(rs.layers[1].rotation, r1)
 
 
-class _StubAttn(nn.Module):
-    def __init__(self, hidden_dim: int, num_q_heads: int, num_kv_heads: int, head_dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(hidden_dim, num_q_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, num_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(num_q_heads * head_dim, hidden_dim, bias=False)
+def test_bake_rotations_is_deprecated() -> None:
+    with pytest.raises(NotImplementedError, match="apply_rotations"):
+        bake_rotations(None, k_rotations=None, v_rotations=None)
 
 
-class _StubLayer(nn.Module):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.self_attn = _StubAttn(**kwargs)
-
-
-class _StubModel(nn.Module):
-    def __init__(self, n_layers: int, **kwargs):
-        super().__init__()
-        self.layers = nn.ModuleList([_StubLayer(**kwargs) for _ in range(n_layers)])
-
-
-class _Wrapper(nn.Module):
-    def __init__(self, inner: _StubModel):
-        super().__init__()
-        self.model = inner
-
-
-def test_bake_rotations_is_orthogonally_invariant() -> None:
-    """End-to-end: a baked model produces the same attention block output as
-    the unbaked one (rotations are orthogonal). We do this by computing the
-    block ``attn_out = softmax(QK^T)V`` mapped through o_proj for a random
-    input, both before and after baking.
-    """
-    torch.manual_seed(0)
-    hidden = 32
-    num_q = 4
-    num_kv = 2
-    head_dim = 16
-
-    model = _Wrapper(_StubModel(n_layers=2, hidden_dim=hidden, num_q_heads=num_q, num_kv_heads=num_kv, head_dim=head_dim))
-
-    x = torch.randn(1, 7, hidden)
-
-    def _forward_block(attn: _StubAttn) -> torch.Tensor:
-        q = attn.q_proj(x).view(1, 7, num_q, head_dim).transpose(1, 2)
-        k = attn.k_proj(x).view(1, 7, num_kv, head_dim).transpose(1, 2)
-        v = attn.v_proj(x).view(1, 7, num_kv, head_dim).transpose(1, 2)
-        k_rep = k.repeat_interleave(num_q // num_kv, dim=1)
-        v_rep = v.repeat_interleave(num_q // num_kv, dim=1)
-        scores = (q @ k_rep.transpose(-1, -2)) / (head_dim ** 0.5)
-        out = torch.softmax(scores, dim=-1) @ v_rep
-        out = out.transpose(1, 2).reshape(1, 7, num_q * head_dim)
-        return attn.o_proj(out)
-
-    baseline = [_forward_block(layer.self_attn).clone() for layer in model.model.layers]
-
-    r_k = {i: _orthogonal(head_dim, 100 + i) for i in range(2)}
-    r_v = {i: _orthogonal(head_dim, 200 + i) for i in range(2)}
-    k_set = RotationSet(objective="test", layers={i: LayerRotation(i, r_k[i], torch.ones(head_dim)) for i in r_k})
-    v_set = RotationSet(objective="test", layers={i: LayerRotation(i, r_v[i], torch.ones(head_dim)) for i in r_v})
-
-    bake_rotations(model, k_rotations=k_set, v_rotations=v_set)
-
-    baked = [_forward_block(layer.self_attn).clone() for layer in model.model.layers]
-
-    for i, (a, b) in enumerate(zip(baseline, baked)):
-        assert torch.allclose(a, b, atol=1e-4), (
-            f"layer {i}: baked block output diverges from baseline (orthogonal "
-            f"rotation should be a no-op end-to-end). max err = "
-            f"{(a - b).abs().max().item():.3e}"
-        )
-
-
-def test_bake_refuses_partial_coverage() -> None:
-    model = _Wrapper(_StubModel(n_layers=3, hidden_dim=32, num_q_heads=4, num_kv_heads=2, head_dim=16))
-    r = _orthogonal(16, 0)
-    half = RotationSet(
+def _rotation_set(num_layers: int, head_dim: int, seed_base: int) -> RotationSet:
+    return RotationSet(
         objective="test",
-        layers={i: LayerRotation(i, r, torch.ones(16)) for i in (0, 1)},
+        layers={
+            i: LayerRotation(i, _orthogonal(head_dim, seed_base + i), torch.ones(head_dim))
+            for i in range(num_layers)
+        },
     )
+
+
+def test_apply_rotations_preserves_qwen3_block_output() -> None:
+    """End-to-end: apply_rotations must produce the same attention output as
+    an unrotated forward in infinite precision (rotations are orthogonal).
+
+    We test against a real Qwen3Attention block — with q_norm, k_norm, RoPE,
+    GQA, and the full attention machinery — at fp32, where bf16 accumulation
+    noise is not a confound. This is the test that would have caught the
+    initial bake_rotations bug.
+    """
+    pytest.importorskip("transformers")
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
+
+    head_dim = 32
+    num_q_heads = 4
+    num_kv_heads = 2
+    cfg = Qwen3Config(
+        hidden_size=num_q_heads * head_dim,
+        num_attention_heads=num_q_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        num_hidden_layers=1,
+        intermediate_size=64,
+        max_position_embeddings=64,
+        attention_dropout=0.0,
+        _attn_implementation="eager",
+    )
+
+    torch.manual_seed(0)
+    attn = Qwen3Attention(cfg, layer_idx=0).to(torch.float32).eval()
+
+    seq = 7
+    hidden = torch.randn(1, seq, cfg.hidden_size, dtype=torch.float32)
+    # Build cos/sin for RoPE manually (head_dim cosine sweep).
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    positions = torch.arange(seq).float().unsqueeze(-1)
+    freqs = positions * inv_freq.unsqueeze(0)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos().unsqueeze(0)
+    sin = emb.sin().unsqueeze(0)
+    position_embeddings = (cos, sin)
+
+    out_baseline, _ = attn(hidden, position_embeddings, attention_mask=None, past_key_values=None)
+    out_baseline = out_baseline.clone()
+
+    class _Wrap(torch.nn.Module):
+        def __init__(self, attn):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([
+                torch.nn.Module(),
+            ])
+            self.model.layers[0].self_attn = attn
+
+    model = _Wrap(attn)
+    k_set = _rotation_set(num_layers=1, head_dim=head_dim, seed_base=100)
+    v_set = _rotation_set(num_layers=1, head_dim=head_dim, seed_base=200)
+
+    apply_rotations(model, k_rotations=k_set, v_rotations=v_set)
+
+    out_rotated, _ = attn(hidden, position_embeddings, attention_mask=None, past_key_values=None)
+
+    max_err = (out_baseline - out_rotated).abs().max().item()
+    assert max_err < 1e-4, (
+        f"rotated block output diverges from baseline (orthogonal rotation "
+        f"should be a no-op end-to-end). max err = {max_err:.3e}"
+    )
+
+
+def test_apply_rotations_refuses_partial_coverage() -> None:
+    pytest.importorskip("transformers")
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
+
+    head_dim = 32
+    cfg = Qwen3Config(
+        hidden_size=4 * head_dim,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=head_dim,
+        num_hidden_layers=3,
+        intermediate_size=64,
+        max_position_embeddings=64,
+        _attn_implementation="eager",
+    )
+    attns = [Qwen3Attention(cfg, layer_idx=i).to(torch.float32) for i in range(3)]
+
+    class _Wrap(torch.nn.Module):
+        def __init__(self, attns):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in attns])
+            for layer, a in zip(self.model.layers, attns):
+                layer.self_attn = a
+
+    model = _Wrap(attns)
+    half = _rotation_set(num_layers=2, head_dim=head_dim, seed_base=0)
     with pytest.raises(KeyError):
-        bake_rotations(model, k_rotations=half, v_rotations=half)
+        apply_rotations(model, k_rotations=half, v_rotations=half)

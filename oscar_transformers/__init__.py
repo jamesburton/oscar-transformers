@@ -13,7 +13,7 @@ Public API:
 from __future__ import annotations
 
 from .cache import OSCARCache
-from .rotation import bake_rotations, load_rotation_file
+from .rotation import apply_rotations, bake_rotations, load_rotation_file
 
-__all__ = ["OSCARCache", "bake_rotations", "load_rotation_file"]
-__version__ = "0.0.1"
+__all__ = ["OSCARCache", "apply_rotations", "bake_rotations", "load_rotation_file"]
+__version__ = "0.0.2"
