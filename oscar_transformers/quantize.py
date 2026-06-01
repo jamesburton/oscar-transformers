@@ -90,7 +90,13 @@ def quantize_per_token(
     q_max = (1 << bits) - 1
     denom = (maxs - mins).clamp(min=1e-8)
     scale = denom / q_max
-    zero = (-mins / scale).round().clamp(0, q_max)
+    # Continuous zero-point (NOT rounded to an integer). For INT2 with only 4
+    # levels, snapping zero to {0..q_max} shifts the entire quantization grid
+    # by up to scale/2 per group, which empirically destroys mid-prompt recall
+    # even on unrotated K/V. Upstream's simulate_int2_asym in
+    # rotation/compute_kv_rotation.py also keeps zero continuous. The fp16
+    # storage on QuantizedBlock has plenty of precision for it.
+    zero = -mins / scale
 
     x_q = (grouped / scale.unsqueeze(-1) + zero.unsqueeze(-1)).round().clamp(0, q_max)
     codes = x_q.to(torch.uint8).reshape(b, h, t, d)
