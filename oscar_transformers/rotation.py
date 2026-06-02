@@ -183,11 +183,12 @@ def _build_patched_forward():
         )
 
         b, t = attn_output.shape[0], attn_output.shape[1]
-        attn_output = attn_output.reshape(b, t, -1, self.head_dim)
-        r_v_T = r_v.transpose(-1, -2).to(attn_output.dtype)
-        attn_output = torch.einsum("bthd,de->bthe", attn_output, r_v_T)
         attn_output = attn_output.reshape(b, t, -1).contiguous()
 
+        # ``o_proj.weight`` has the R_v.T per-head un-rotation baked in by
+        # :func:`apply_rotations`, so no runtime un-rotation einsum here.
+        # Math: ``W_o' = W_o @ block_diag(R_v.T, ..., R_v.T per head)`` gives
+        # the same output as the prior reshape/einsum/reshape sequence.
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -212,6 +213,54 @@ def _looks_like_delta_mem_attention(attn: nn.Module) -> bool:
     )
 
 
+def _bake_r_v_T_into_o_proj(o_proj: nn.Module, r_v: torch.Tensor) -> None:
+    """Absorb the R_v.T per-head un-rotation into ``o_proj.weight`` in place.
+
+    Math: at runtime the rotated attention output ``attn_rot`` (B, T, H, D)
+    needs ``R_v.T`` applied per head before the linear ``W_o``. That is:
+
+        attn_unrot[..., h, :] = attn_rot[..., h, :] @ R_v.T
+        out = W_o @ attn_unrot.flatten()
+
+    Equivalent baked form: ``W_o' = W_o @ block_diag(R_v.T, ..., R_v.T)`` with
+    one ``R_v.T`` block per head. Then ``out = W_o' @ attn_rot.flatten()``
+    skips the un-rotation entirely.
+
+    Delta-mem compatibility: in ``DeltaMemAttention.forward``
+    (``delta-Mem/deltamem/core/delta_impl.py:2280-2294``), ``delta_o`` is
+    added *after* ``base.o_proj(attn_output)`` and so already lives in the
+    un-rotated basis — no further adjustment needed.
+
+    Idempotent: the original weight is saved as
+    ``o_proj._oscar_original_weight`` on first call. Subsequent calls
+    re-bake from the saved original, so changing rotations is safe.
+    """
+    if not hasattr(o_proj, "weight"):
+        raise TypeError(
+            f"_bake_r_v_T_into_o_proj expects a linear-like module with .weight; "
+            f"got {type(o_proj).__name__}"
+        )
+    head_dim = int(r_v.shape[0])
+    # Save original on first bake; restore from it on subsequent re-bakes.
+    if not hasattr(o_proj, "_oscar_original_weight"):
+        o_proj._oscar_original_weight = o_proj.weight.detach().clone()  # type: ignore[attr-defined]
+    w = o_proj._oscar_original_weight  # type: ignore[attr-defined]
+    out_features, in_features = w.shape
+    if in_features % head_dim != 0:
+        raise ValueError(
+            f"o_proj in_features={in_features} not divisible by head_dim={head_dim}"
+        )
+    n_heads = in_features // head_dim
+    # Cast rotation to match weight dtype; einsum stays in that dtype.
+    r_v_t = r_v.to(device=w.device, dtype=w.dtype)
+    w_per_head = w.view(out_features, n_heads, head_dim)
+    # New[o, h, e] = sum_d  W[o, h, d] * R_v.T[d, e]
+    #              = sum_d  W[o, h, d] * R_v[e, d]
+    w_baked = torch.einsum("ohd,ed->ohe", w_per_head, r_v_t).reshape(out_features, in_features)
+    with torch.no_grad():
+        o_proj.weight.data.copy_(w_baked)
+
+
 def _patch_delta_mem_instance(attn: nn.Module, r_k: torch.Tensor, r_v: torch.Tensor) -> None:
     """Per-instance rotation injection for a single DeltaMemAttention block.
 
@@ -226,44 +275,44 @@ def _patch_delta_mem_instance(attn: nn.Module, r_k: torch.Tensor, r_v: torch.Ten
         past_key_values.update(key_states, value_states, ...)
         attn_output = attention_interface(self.base, query_states, key_states, value_states, ...)
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        base_o_output = self.base.o_proj(attn_output)   # *** un-rotation injected HERE ***
+        base_o_output = self.base.o_proj(attn_output)   # un-rotation BAKED into o_proj.weight
         attn_output = base_o_output + delta_o
         return attn_output, attn_weights
 
-    Patching the whole forward is fragile (it's >100 lines). Instead we
-    monkey-patch three points at instance level:
+    Two instance-level patches plus one weight bake:
 
     1. ``_apply_standard_rotary`` → also rotate Q and K by R_k after RoPE.
     2. ``_normalize_value_states`` → also rotate V by R_v after the norm.
        Note V is in shape (B, T, H, D) here (still pre-transpose); we rotate
        along the last (head_dim) axis, which is shape-agnostic.
-    3. ``self.base.o_proj`` is wrapped with a Module that un-rotates by
-       R_v.T along head_dim before applying the original o_proj. This is
-       the un-rotation site because delta-Mem reshapes ``attn_output`` from
-       (B, T, H, D) to (B, T, H*D) before calling base.o_proj.
+    3. ``self.base.o_proj.weight`` is rewritten by
+       :func:`_bake_r_v_T_into_o_proj` to absorb the R_v.T un-rotation. No
+       wrapper module needed; the original o_proj forward runs unchanged
+       but on the rotated inputs.
 
-    All three patches are on the INSTANCE (not the class). This keeps the
-    patch local to one block and avoids any class-level side effects.
+    The instance-level method patches keep the change local to one block
+    and avoid any class-level side effects. The weight bake is global to
+    the o_proj module but reversible via the saved
+    ``_oscar_original_weight``.
     """
     head_dim = attn.head_dim
     device = next(attn.parameters()).device
     dtype = next(attn.parameters()).dtype
     r_k_t = r_k.to(device=device, dtype=dtype)
     r_v_t = r_v.to(device=device, dtype=dtype)
-    r_v_T = r_v_t.transpose(-1, -2).contiguous()
-
-    if getattr(attn, "_oscar_delta_patched", False):
-        # Re-apply: just refresh buffers (rotation values may have changed).
-        attn._oscar_k_rot = r_k_t  # type: ignore[attr-defined]
-        attn._oscar_v_rot = r_v_t  # type: ignore[attr-defined]
-        attn._oscar_v_rot_T = r_v_T  # type: ignore[attr-defined]
-        # The wrapped o_proj already references attn._oscar_v_rot_T via attr
-        # lookup at call time, so the new value flows through automatically.
-        return
 
     attn._oscar_k_rot = r_k_t  # type: ignore[attr-defined]
     attn._oscar_v_rot = r_v_t  # type: ignore[attr-defined]
-    attn._oscar_v_rot_T = r_v_T  # type: ignore[attr-defined]
+    # The o_proj bake always reads ``r_v`` (full precision input here, will
+    # be cast to weight dtype inside the helper) and snapshots/restores the
+    # original weight, so re-baking with a new rotation is safe.
+    _bake_r_v_T_into_o_proj(attn.base.o_proj, r_v)
+
+    if getattr(attn, "_oscar_delta_patched", False):
+        # Method patches are class-method shadows on the instance; only need
+        # to wire once. Buffer values are updated above and read at call
+        # time by the closures below.
+        return
 
     orig_apply_rotary = attn._apply_standard_rotary
 
@@ -284,39 +333,9 @@ def _patch_delta_mem_instance(attn: nn.Module, r_k: torch.Tensor, r_v: torch.Ten
         # called before .transpose(1, 2) in DeltaMemAttention.forward. We
         # rotate the trailing head_dim axis which is shape-invariant.
         rv = attn._oscar_v_rot.to(out.dtype)
-        # Use a robust einsum that handles either (B, T, H, D) or (B, H, T, D).
         return torch.einsum("...d,de->...e", out, rv)
 
     attn._normalize_value_states = patched_normalize_value_states  # type: ignore[assignment]
-
-    orig_o_proj = attn.base.o_proj
-
-    class _OSCARUnrotatingOProj(nn.Module):
-        """Wraps the original o_proj. Un-rotates attn_output by R_v.T along
-        head_dim before applying the original linear projection.
-        """
-
-        def __init__(self, orig, head_dim, host_attn):
-            super().__init__()
-            self._orig = orig
-            self._head_dim = head_dim
-            # Reference the host attention block so we read its current
-            # ``_oscar_v_rot_T`` at call time. Re-apply updates that buffer
-            # in place and we want the new value to flow through.
-            self._host_attn = host_attn
-
-        def forward(self, x):
-            # x is (B, T, H * head_dim). Reshape to (B, T, H, D), un-rotate
-            # along D, reshape back. This must happen BEFORE the linear,
-            # because the linear acts on H*D and would mix channels.
-            b, t = x.shape[0], x.shape[1]
-            x_rs = x.reshape(b, t, -1, self._head_dim)
-            r_v_T = self._host_attn._oscar_v_rot_T.to(x_rs.dtype)
-            x_unrot = torch.einsum("bthd,de->bthe", x_rs, r_v_T)
-            x_back = x_unrot.reshape(b, t, -1).contiguous()
-            return self._orig(x_back)
-
-    attn.base.o_proj = _OSCARUnrotatingOProj(orig_o_proj, head_dim, attn)
     attn._oscar_delta_patched = True  # type: ignore[attr-defined]
 
 
@@ -332,17 +351,19 @@ def apply_rotations(
 
     1. **Plain ``Qwen3Attention``** (the typical case, also the base arm of
        delta-mem-tests): attach ``_oscar_k_rot`` / ``_oscar_v_rot`` buffers
-       to each attention module and replace the class's ``forward`` with a
+       to each attention module, replace the class's ``forward`` with a
        patched version that injects the rotation between
-       q_norm/k_norm + RoPE and ``past_key_values.update``, then un-rotates
-       ``attn_output`` by R_v.T before ``o_proj``.
+       q_norm/k_norm + RoPE and ``past_key_values.update``, and bake the
+       R_v.T un-rotation directly into ``o_proj.weight`` so the runtime
+       does not pay an extra einsum.
 
     2. **``DeltaMemAttention`` wrapper** (delta-Mem's delta arm): the wrapper
        re-implements attention internally and does not call
        ``self.base.forward``, so the class-level patch from (1) is bypassed.
-       For each instance we monkey-patch three methods at instance level
-       (``_apply_standard_rotary``, ``_normalize_value_states``, and
-       ``self.base.o_proj``); see :func:`_patch_delta_mem_instance`.
+       For each instance we monkey-patch two methods at instance level
+       (``_apply_standard_rotary``, ``_normalize_value_states``) and bake
+       R_v.T into ``self.base.o_proj.weight``; see
+       :func:`_patch_delta_mem_instance`.
 
     Calling :func:`apply_rotations` repeatedly on the same model is safe:
     buffers are refreshed and patches are guarded by sentinel flags.
@@ -373,6 +394,11 @@ def apply_rotations(
             attn.register_buffer(
                 "_oscar_v_rot", r_v.to(device=device, dtype=dtype), persistent=False,
             )
+            # Absorb the R_v.T un-rotation into o_proj.weight in place so
+            # the patched forward can skip the reshape/einsum/reshape
+            # un-rotation step. Idempotent and reversible (helper saves
+            # ``_oscar_original_weight`` on first call).
+            _bake_r_v_T_into_o_proj(attn.o_proj, r_v)
             seen_qwen3_classes.add(type(attn))
         attached_layers += 1
 

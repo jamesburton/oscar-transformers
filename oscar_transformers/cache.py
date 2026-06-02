@@ -190,6 +190,80 @@ class OSCARCacheLayer(CacheLayerMixin):
             return empty, empty
         return torch.cat(parts_k, dim=2), torch.cat(parts_v, dim=2)
 
+    def snapshot(self) -> dict:
+        """Capture the full layer state into a CPU-resident dict that
+        :meth:`restore_from` can later replay.
+
+        Cross-question cache reuse: ``Cache.crop(history_len)`` is
+        fundamentally hard for OSCAR because the INT2 middle stores per-
+        token-per-group scale/zero with group-128 boundaries that don't
+        align with arbitrary truncation lengths. Snapshot/restore at a
+        single checkpoint (typically end-of-history prefill) sidesteps the
+        boundary problem entirely: we capture every per-region tensor as
+        it stands and replay it verbatim before each subsequent question.
+
+        Tensors are moved to CPU so the snapshot survives independent of
+        GPU lifecycle and doesn't compete for VRAM with the live decode.
+        """
+        def _clone_cpu(t):
+            return None if t is None else t.detach().to("cpu").clone()
+
+        def _clone_block_cpu(b):
+            if b is None:
+                return None
+            return QuantizedBlock(
+                codes=b.codes.detach().to("cpu").clone(),
+                scale=b.scale.detach().to("cpu").clone(),
+                zero=b.zero.detach().to("cpu").clone(),
+                bits=b.bits,
+                group_size=b.group_size,
+            )
+
+        return {
+            "is_initialized": self.is_initialized,
+            "dtype": self.dtype,
+            "device": str(self.device) if self.device is not None else None,
+            "sink_k": _clone_cpu(self.sink_k),
+            "sink_v": _clone_cpu(self.sink_v),
+            "middle_k": _clone_block_cpu(self.middle_k),
+            "middle_v": _clone_block_cpu(self.middle_v),
+            "recent_k": _clone_cpu(self.recent_k),
+            "recent_v": _clone_cpu(self.recent_v),
+            "middle_k_dq": _clone_cpu(self._middle_k_dq),
+            "middle_v_dq": _clone_cpu(self._middle_v_dq),
+        }
+
+    def restore_from(self, state: dict, device: Optional[torch.device] = None) -> None:
+        """Replace this layer's state with a snapshot. Tensors move back to
+        the requested device (or the snapshot's recorded device).
+        """
+        target_device = device or torch.device(state["device"] or "cpu")
+        def _to_dev(t):
+            return None if t is None else t.to(target_device)
+
+        def _block_to_dev(b):
+            if b is None:
+                return None
+            return QuantizedBlock(
+                codes=b.codes.to(target_device),
+                scale=b.scale.to(target_device),
+                zero=b.zero.to(target_device),
+                bits=b.bits,
+                group_size=b.group_size,
+            )
+
+        self.is_initialized = bool(state["is_initialized"])
+        self.dtype = state["dtype"]
+        self.device = target_device
+        self.sink_k = _to_dev(state["sink_k"])
+        self.sink_v = _to_dev(state["sink_v"])
+        self.middle_k = _block_to_dev(state["middle_k"])
+        self.middle_v = _block_to_dev(state["middle_v"])
+        self.recent_k = _to_dev(state["recent_k"])
+        self.recent_v = _to_dev(state["recent_v"])
+        self._middle_k_dq = _to_dev(state["middle_k_dq"])
+        self._middle_v_dq = _to_dev(state["middle_v_dq"])
+
 
 class OSCARCache(Cache):
     """OSCAR mixed-precision KV cache.
@@ -238,3 +312,19 @@ class OSCARCache(Cache):
             for _ in range(n_layers)
         ]
         super().__init__(layers=layers)
+
+    def snapshot(self) -> list:
+        """Return a list of per-layer snapshots (see
+        :meth:`OSCARCacheLayer.snapshot`). The list is the durable artifact
+        — pass it back to :meth:`restore_from` to roll the whole cache back
+        to this point.
+        """
+        return [layer.snapshot() for layer in self.layers]
+
+    def restore_from(self, snapshots: list, device: Optional[torch.device] = None) -> None:
+        if len(snapshots) != len(self.layers):
+            raise ValueError(
+                f"snapshot has {len(snapshots)} layers; cache has {len(self.layers)}"
+            )
+        for layer, snap in zip(self.layers, snapshots):
+            layer.restore_from(snap, device=device)
