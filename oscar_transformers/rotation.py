@@ -194,35 +194,165 @@ def _build_patched_forward():
     return patched_forward
 
 
+def _looks_like_delta_mem_attention(attn: nn.Module) -> bool:
+    """Duck-type check for delta-Mem's DeltaMemAttention wrapper.
+
+    delta-Mem wraps each ``Qwen3Attention`` (or ``SmolLM3Attention``) inside a
+    ``DeltaMemAttention`` that re-implements attention internally to thread
+    the delta-state through, instead of delegating to ``self.base.forward``.
+    That means our class-level patch on ``Qwen3Attention.forward`` is bypassed
+    entirely on the delta arm. We detect the wrapper by structure rather than
+    importing it, to keep oscar-transformers free of a delta-Mem dependency.
+    """
+    return (
+        hasattr(attn, "base")
+        and hasattr(attn.base, "q_proj")
+        and hasattr(attn, "_apply_standard_rotary")
+        and hasattr(attn, "_normalize_value_states")
+    )
+
+
+def _patch_delta_mem_instance(attn: nn.Module, r_k: torch.Tensor, r_v: torch.Tensor) -> None:
+    """Per-instance rotation injection for a single DeltaMemAttention block.
+
+    DeltaMemAttention.forward (delta-Mem/deltamem/core/delta_impl.py) does:
+
+        query_states, key_states, value_states = self._apply_delta_qkv(...)
+        query_states = self._normalize_query_states(query_states).transpose(1, 2)
+        key_states   = self._normalize_key_states(key_states).transpose(1, 2)
+        value_states = self._normalize_value_states(value_states).transpose(1, 2)
+        query_states, key_states = self._apply_standard_rotary(...)
+        # *** rotation injected HERE — before past_key_values.update ***
+        past_key_values.update(key_states, value_states, ...)
+        attn_output = attention_interface(self.base, query_states, key_states, value_states, ...)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        base_o_output = self.base.o_proj(attn_output)   # *** un-rotation injected HERE ***
+        attn_output = base_o_output + delta_o
+        return attn_output, attn_weights
+
+    Patching the whole forward is fragile (it's >100 lines). Instead we
+    monkey-patch three points at instance level:
+
+    1. ``_apply_standard_rotary`` → also rotate Q and K by R_k after RoPE.
+    2. ``_normalize_value_states`` → also rotate V by R_v after the norm.
+       Note V is in shape (B, T, H, D) here (still pre-transpose); we rotate
+       along the last (head_dim) axis, which is shape-agnostic.
+    3. ``self.base.o_proj`` is wrapped with a Module that un-rotates by
+       R_v.T along head_dim before applying the original o_proj. This is
+       the un-rotation site because delta-Mem reshapes ``attn_output`` from
+       (B, T, H, D) to (B, T, H*D) before calling base.o_proj.
+
+    All three patches are on the INSTANCE (not the class). This keeps the
+    patch local to one block and avoids any class-level side effects.
+    """
+    head_dim = attn.head_dim
+    device = next(attn.parameters()).device
+    dtype = next(attn.parameters()).dtype
+    r_k_t = r_k.to(device=device, dtype=dtype)
+    r_v_t = r_v.to(device=device, dtype=dtype)
+    r_v_T = r_v_t.transpose(-1, -2).contiguous()
+
+    if getattr(attn, "_oscar_delta_patched", False):
+        # Re-apply: just refresh buffers (rotation values may have changed).
+        attn._oscar_k_rot = r_k_t  # type: ignore[attr-defined]
+        attn._oscar_v_rot = r_v_t  # type: ignore[attr-defined]
+        attn._oscar_v_rot_T = r_v_T  # type: ignore[attr-defined]
+        # The wrapped o_proj already references attn._oscar_v_rot_T via attr
+        # lookup at call time, so the new value flows through automatically.
+        return
+
+    attn._oscar_k_rot = r_k_t  # type: ignore[attr-defined]
+    attn._oscar_v_rot = r_v_t  # type: ignore[attr-defined]
+    attn._oscar_v_rot_T = r_v_T  # type: ignore[attr-defined]
+
+    orig_apply_rotary = attn._apply_standard_rotary
+
+    def patched_apply_standard_rotary(query_states, key_states, cos, sin):
+        q, k = orig_apply_rotary(query_states, key_states, cos, sin)
+        rk = attn._oscar_k_rot.to(q.dtype)
+        q = torch.einsum("bhtd,de->bhte", q, rk)
+        k = torch.einsum("bhtd,de->bhte", k, rk)
+        return q, k
+
+    attn._apply_standard_rotary = patched_apply_standard_rotary  # type: ignore[assignment]
+
+    orig_normalize_v = attn._normalize_value_states
+
+    def patched_normalize_value_states(states):
+        out = orig_normalize_v(states)
+        # ``out`` is (B, T, H, D) at this point — _normalize_value_states is
+        # called before .transpose(1, 2) in DeltaMemAttention.forward. We
+        # rotate the trailing head_dim axis which is shape-invariant.
+        rv = attn._oscar_v_rot.to(out.dtype)
+        # Use a robust einsum that handles either (B, T, H, D) or (B, H, T, D).
+        return torch.einsum("...d,de->...e", out, rv)
+
+    attn._normalize_value_states = patched_normalize_value_states  # type: ignore[assignment]
+
+    orig_o_proj = attn.base.o_proj
+
+    class _OSCARUnrotatingOProj(nn.Module):
+        """Wraps the original o_proj. Un-rotates attn_output by R_v.T along
+        head_dim before applying the original linear projection.
+        """
+
+        def __init__(self, orig, head_dim, host_attn):
+            super().__init__()
+            self._orig = orig
+            self._head_dim = head_dim
+            # Reference the host attention block so we read its current
+            # ``_oscar_v_rot_T`` at call time. Re-apply updates that buffer
+            # in place and we want the new value to flow through.
+            self._host_attn = host_attn
+
+        def forward(self, x):
+            # x is (B, T, H * head_dim). Reshape to (B, T, H, D), un-rotate
+            # along D, reshape back. This must happen BEFORE the linear,
+            # because the linear acts on H*D and would mix channels.
+            b, t = x.shape[0], x.shape[1]
+            x_rs = x.reshape(b, t, -1, self._head_dim)
+            r_v_T = self._host_attn._oscar_v_rot_T.to(x_rs.dtype)
+            x_unrot = torch.einsum("bthd,de->bthe", x_rs, r_v_T)
+            x_back = x_unrot.reshape(b, t, -1).contiguous()
+            return self._orig(x_back)
+
+    attn.base.o_proj = _OSCARUnrotatingOProj(orig_o_proj, head_dim, attn)
+    attn._oscar_delta_patched = True  # type: ignore[attr-defined]
+
+
 def apply_rotations(
     model: nn.Module,
     *,
     k_rotations: RotationSet,
     v_rotations: RotationSet,
 ) -> None:
-    """Wire OSCAR K and V rotations into ``model`` by:
+    """Wire OSCAR K and V rotations into ``model``.
 
-    1. Attaching ``_oscar_k_rot`` and ``_oscar_v_rot`` buffers (head_dim x
-       head_dim, in the attention module's dtype/device) to every attention
-       block.
-    2. Replacing the attention class's ``forward`` with a patched version
-       (once per class per process) that applies the rotations at the right
-       point relative to q_norm, k_norm, RoPE, and the cache.
+    Two code paths depending on what wraps each layer's ``self_attn``:
 
-    The patched ``forward`` produces the same output as the original in
-    infinite precision (rotations are orthogonal). The benefit is that the
-    K, V tensors that pass through ``past_key_values.update`` are in a basis
-    where INT2 quantization is well-conditioned.
+    1. **Plain ``Qwen3Attention``** (the typical case, also the base arm of
+       delta-mem-tests): attach ``_oscar_k_rot`` / ``_oscar_v_rot`` buffers
+       to each attention module and replace the class's ``forward`` with a
+       patched version that injects the rotation between
+       q_norm/k_norm + RoPE and ``past_key_values.update``, then un-rotates
+       ``attn_output`` by R_v.T before ``o_proj``.
 
-    Calling :func:`apply_rotations` a second time on the same model is safe:
-    the buffers are overwritten and the class is already patched.
+    2. **``DeltaMemAttention`` wrapper** (delta-Mem's delta arm): the wrapper
+       re-implements attention internally and does not call
+       ``self.base.forward``, so the class-level patch from (1) is bypassed.
+       For each instance we monkey-patch three methods at instance level
+       (``_apply_standard_rotary``, ``_normalize_value_states``, and
+       ``self.base.o_proj``); see :func:`_patch_delta_mem_instance`.
+
+    Calling :func:`apply_rotations` repeatedly on the same model is safe:
+    buffers are refreshed and patches are guarded by sentinel flags.
     """
     if k_rotations.head_dim != v_rotations.head_dim:
         raise ValueError(
             f"K head_dim={k_rotations.head_dim} != V head_dim={v_rotations.head_dim}"
         )
 
-    seen_classes: set[type] = set()
+    seen_qwen3_classes: set[type] = set()
     attached_layers = 0
     for layer_idx, attn in _iter_attention_blocks(model):
         if layer_idx not in k_rotations.layers:
@@ -231,11 +361,19 @@ def apply_rotations(
             raise KeyError(f"V rotations missing for layer {layer_idx}")
         r_k = k_rotations.layers[layer_idx].rotation
         r_v = v_rotations.layers[layer_idx].rotation
-        device = next(attn.parameters()).device
-        dtype = next(attn.parameters()).dtype
-        attn.register_buffer("_oscar_k_rot", r_k.to(device=device, dtype=dtype), persistent=False)
-        attn.register_buffer("_oscar_v_rot", r_v.to(device=device, dtype=dtype), persistent=False)
-        seen_classes.add(type(attn))
+
+        if _looks_like_delta_mem_attention(attn):
+            _patch_delta_mem_instance(attn, r_k, r_v)
+        else:
+            device = next(attn.parameters()).device
+            dtype = next(attn.parameters()).dtype
+            attn.register_buffer(
+                "_oscar_k_rot", r_k.to(device=device, dtype=dtype), persistent=False,
+            )
+            attn.register_buffer(
+                "_oscar_v_rot", r_v.to(device=device, dtype=dtype), persistent=False,
+            )
+            seen_qwen3_classes.add(type(attn))
         attached_layers += 1
 
     if attached_layers != len(k_rotations.layers):
@@ -245,12 +383,13 @@ def apply_rotations(
             f"half-rotated."
         )
 
-    patched_forward = _build_patched_forward()
-    for cls in seen_classes:
-        if cls in _PATCHED_CLASSES:
-            continue
-        cls.forward = patched_forward
-        _PATCHED_CLASSES.add(cls)
+    if seen_qwen3_classes:
+        patched_forward = _build_patched_forward()
+        for cls in seen_qwen3_classes:
+            if cls in _PATCHED_CLASSES:
+                continue
+            cls.forward = patched_forward
+            _PATCHED_CLASSES.add(cls)
 
 
 def bake_rotations(*args, **kwargs):

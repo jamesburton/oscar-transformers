@@ -65,6 +65,14 @@ class OSCARCacheLayer(CacheLayerMixin):
         self.middle_v: Optional[QuantizedBlock] = None
         self.recent_k: Optional[torch.Tensor] = None
         self.recent_v: Optional[torch.Tensor] = None
+        # Decode-time fast path: maintain the dequantized middle region
+        # incrementally so :meth:`_assemble` does not re-dequantize the entire
+        # ~17 k-token INT2 middle on every decoded token. Each spill from
+        # ``recent`` into ``middle`` dequantizes only the spilled chunk and
+        # appends it to ``_middle_k_dq`` / ``_middle_v_dq``. This caches the
+        # bf16 cost in exchange for ~2× the middle's VRAM (codes + dequant).
+        self._middle_k_dq: Optional[torch.Tensor] = None
+        self._middle_v_dq: Optional[torch.Tensor] = None
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
         self.dtype = key_states.dtype
@@ -92,6 +100,8 @@ class OSCARCacheLayer(CacheLayerMixin):
         self.sink_k = self.sink_v = None
         self.middle_k = self.middle_v = None
         self.recent_k = self.recent_v = None
+        self._middle_k_dq = None
+        self._middle_v_dq = None
 
     def reorder_cache(self, beam_idx: torch.Tensor) -> None:
         raise NotImplementedError("OSCARCacheLayer does not support beam search yet.")
@@ -148,18 +158,30 @@ class OSCARCacheLayer(CacheLayerMixin):
             self.middle_k = quant_k if self.middle_k is None else concat_blocks((self.middle_k, quant_k))
             self.middle_v = quant_v if self.middle_v is None else concat_blocks((self.middle_v, quant_v))
 
+            # Maintain the dequantized-middle cache incrementally so :meth:`_assemble`
+            # does not re-dequantize the entire INT2 middle on every decoded token.
+            # Dequant cost goes from O(total_middle) per step to O(spill_size) per spill.
+            dtype = self.dtype or torch.bfloat16
+            dq_k = dequantize(quant_k, dtype=dtype)
+            dq_v = dequantize(quant_v, dtype=dtype)
+            if self._middle_k_dq is None:
+                self._middle_k_dq = dq_k
+                self._middle_v_dq = dq_v
+            else:
+                self._middle_k_dq = torch.cat([self._middle_k_dq, dq_k], dim=2)
+                self._middle_v_dq = torch.cat([self._middle_v_dq, dq_v], dim=2)
+
         return self._assemble()
 
     def _assemble(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        dtype = self.dtype or torch.bfloat16
         parts_k: List[torch.Tensor] = []
         parts_v: List[torch.Tensor] = []
         if self.sink_k is not None:
             parts_k.append(self.sink_k)
             parts_v.append(self.sink_v)
-        if self.middle_k is not None:
-            parts_k.append(dequantize(self.middle_k, dtype=dtype))
-            parts_v.append(dequantize(self.middle_v, dtype=dtype))
+        if self._middle_k_dq is not None:
+            parts_k.append(self._middle_k_dq)
+            parts_v.append(self._middle_v_dq)
         if self.recent_k is not None:
             parts_k.append(self.recent_k)
             parts_v.append(self.recent_v)
