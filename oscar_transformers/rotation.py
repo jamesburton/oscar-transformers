@@ -252,17 +252,24 @@ def _bake_r_v_T_into_o_proj(o_proj: nn.Module, r_v: torch.Tensor) -> None:
         )
     n_heads = in_features // head_dim
     # Cast rotation to match weight dtype; einsum stays in that dtype.
-    r_v_t = r_v.to(device=w.device, dtype=w.dtype)
-    w_per_head = w.view(out_features, n_heads, head_dim)
+    # Bake in fp32 then cast back to weight dtype. At long context (e.g. 17k
+    # tokens x 36 layers) doing the bake einsum directly in bf16 accumulates
+    # enough precision loss in the baked weights to degrade end-to-end
+    # quality on LoCoMo conv-0/10q (v3c showed base 0.1333 vs v2's 0.2379).
+    # The runtime numerics still happen in the model's native dtype; only
+    # the offline bake math is upgraded to fp32.
+    target_dtype = w.dtype
+    w_fp32 = w.to(torch.float32)
+    r_v_fp32 = r_v.to(device=w.device, dtype=torch.float32)
+    w_per_head = w_fp32.view(out_features, n_heads, head_dim)
     # The runtime un-rotation that we are absorbing is
     # ``O_orig[h, e] = sum_d O_rot[h, d] * R_v[e, d]``  (== O_rot @ R_v.T).
-    # Therefore the baked weight must satisfy
-    # ``(W_baked @ O_rot_flat) == (W @ O_orig_flat)`` per head, which works out to
-    # ``W_baked[o, h, d_new] = sum_e_old W[o, h, e_old] * R_v[e_old, d_new]``
-    # i.e. ``W @ R_v`` per head (NOT ``W @ R_v.T``).
-    # einsum "ohd,de->ohe" gives ``output[o, h, e] = sum_d w[o, h, d] * r_v[d, e]``,
-    # which is the correct ``W @ R_v`` per head.
-    w_baked = torch.einsum("ohd,de->ohe", w_per_head, r_v_t).reshape(out_features, in_features)
+    # Bake: ``W_baked[o, h, d_new] = sum_e_old W[o, h, e_old] * R_v[e_old, d_new]``
+    # i.e. ``W @ R_v`` per head. einsum "ohd,de->ohe" gives that exactly.
+    w_baked_fp32 = torch.einsum("ohd,de->ohe", w_per_head, r_v_fp32).reshape(
+        out_features, in_features,
+    )
+    w_baked = w_baked_fp32.to(target_dtype)
     with torch.no_grad():
         o_proj.weight.data.copy_(w_baked)
 
