@@ -254,9 +254,15 @@ def _bake_r_v_T_into_o_proj(o_proj: nn.Module, r_v: torch.Tensor) -> None:
     # Cast rotation to match weight dtype; einsum stays in that dtype.
     r_v_t = r_v.to(device=w.device, dtype=w.dtype)
     w_per_head = w.view(out_features, n_heads, head_dim)
-    # New[o, h, e] = sum_d  W[o, h, d] * R_v.T[d, e]
-    #              = sum_d  W[o, h, d] * R_v[e, d]
-    w_baked = torch.einsum("ohd,ed->ohe", w_per_head, r_v_t).reshape(out_features, in_features)
+    # The runtime un-rotation that we are absorbing is
+    # ``O_orig[h, e] = sum_d O_rot[h, d] * R_v[e, d]``  (== O_rot @ R_v.T).
+    # Therefore the baked weight must satisfy
+    # ``(W_baked @ O_rot_flat) == (W @ O_orig_flat)`` per head, which works out to
+    # ``W_baked[o, h, d_new] = sum_e_old W[o, h, e_old] * R_v[e_old, d_new]``
+    # i.e. ``W @ R_v`` per head (NOT ``W @ R_v.T``).
+    # einsum "ohd,de->ohe" gives ``output[o, h, e] = sum_d w[o, h, d] * r_v[d, e]``,
+    # which is the correct ``W @ R_v`` per head.
+    w_baked = torch.einsum("ohd,de->ohe", w_per_head, r_v_t).reshape(out_features, in_features)
     with torch.no_grad():
         o_proj.weight.data.copy_(w_baked)
 
