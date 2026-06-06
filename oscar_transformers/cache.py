@@ -217,6 +217,7 @@ class OSCARCacheLayer(CacheLayerMixin):
                 zero=b.zero.detach().to("cpu").clone(),
                 bits=b.bits,
                 group_size=b.group_size,
+                unpacked_d=b.unpacked_d,
             )
 
         return {
@@ -250,6 +251,7 @@ class OSCARCacheLayer(CacheLayerMixin):
                 zero=b.zero.to(target_device),
                 bits=b.bits,
                 group_size=b.group_size,
+                unpacked_d=b.unpacked_d,
             )
 
         self.is_initialized = bool(state["is_initialized"])

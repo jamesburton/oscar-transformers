@@ -34,6 +34,47 @@ from typing import Tuple
 import torch
 
 
+_PACKABLE_BITS = (1, 2, 4, 8)
+
+
+def _pack_codes(codes: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack ``codes`` of shape ``(..., D)`` uint8 with values in ``[0, 2**bits-1]``
+    into ``(..., D*bits//8)`` uint8. No-op for ``bits == 8``.
+    """
+    if bits == 8:
+        return codes
+    if bits not in _PACKABLE_BITS:
+        raise ValueError(f"packing supports bits in {_PACKABLE_BITS}; got {bits}")
+    per_byte = 8 // bits
+    d = codes.shape[-1]
+    if d % per_byte != 0:
+        raise ValueError(f"last-dim={d} not divisible by {per_byte} packed values/byte")
+    grouped = codes.reshape(*codes.shape[:-1], d // per_byte, per_byte)
+    packed = torch.zeros(*codes.shape[:-1], d // per_byte, dtype=torch.uint8, device=codes.device)
+    for i in range(per_byte):
+        packed = packed | (grouped[..., i] << (i * bits))
+    return packed
+
+
+def _unpack_codes(packed: torch.Tensor, bits: int, unpacked_d: int) -> torch.Tensor:
+    """Reverse of :func:`_pack_codes`. ``unpacked_d`` is the original head_dim."""
+    if bits == 8:
+        return packed
+    if bits not in _PACKABLE_BITS:
+        raise ValueError(f"packing supports bits in {_PACKABLE_BITS}; got {bits}")
+    per_byte = 8 // bits
+    mask = (1 << bits) - 1
+    packed_d = packed.shape[-1]
+    if packed_d * per_byte != unpacked_d:
+        raise ValueError(
+            f"packed last-dim={packed_d} * per_byte={per_byte} != unpacked_d={unpacked_d}"
+        )
+    out = torch.empty(*packed.shape[:-1], packed_d, per_byte, dtype=torch.uint8, device=packed.device)
+    for i in range(per_byte):
+        out[..., i] = (packed >> (i * bits)) & mask
+    return out.reshape(*packed.shape[:-1], unpacked_d)
+
+
 @dataclass
 class QuantizedBlock:
     """A single (batch, heads, tokens) slab of quantized K or V.
@@ -41,9 +82,13 @@ class QuantizedBlock:
     Tensor shapes (with ``T = num_tokens``, ``H = num_heads``, ``D = head_dim``,
     ``G = D // group_size``):
 
-    - ``codes``: ``(B, H, T, D)`` uint8 in ``[0, 2**bits - 1]``
+    - ``codes``: ``(B, H, T, D*bits//8)`` uint8, **packed** along head_dim so
+      ``8 // bits`` values share a byte. For ``bits=2`` this is the headline
+      4× memory win on top of the 2× from "one uint8 per code". For
+      ``bits=8`` codes are stored 1-per-byte unchanged.
     - ``scale``: ``(B, H, T, G)`` fp16
     - ``zero``:  ``(B, H, T, G)`` fp16
+    - ``unpacked_d``: original head_dim before packing (needed to unpack).
     """
 
     codes: torch.Tensor
@@ -51,6 +96,7 @@ class QuantizedBlock:
     zero: torch.Tensor
     bits: int
     group_size: int
+    unpacked_d: int
 
 
 def quantize_per_token(
@@ -99,14 +145,16 @@ def quantize_per_token(
     zero = -mins / scale
 
     x_q = (grouped / scale.unsqueeze(-1) + zero.unsqueeze(-1)).round().clamp(0, q_max)
-    codes = x_q.to(torch.uint8).reshape(b, h, t, d)
+    codes_unpacked = x_q.to(torch.uint8).reshape(b, h, t, d)
+    codes_packed = _pack_codes(codes_unpacked, bits)
 
     return QuantizedBlock(
-        codes=codes,
+        codes=codes_packed,
         scale=scale.to(torch.float16),
         zero=zero.to(torch.float16),
         bits=bits,
         group_size=group_size,
+        unpacked_d=d,
     )
 
 
@@ -114,9 +162,11 @@ def dequantize(block: QuantizedBlock, *, dtype: torch.dtype = torch.bfloat16) ->
     """Reverse of :func:`quantize_per_token`. Returns ``(B, H, T, D)`` in
     the requested floating-point dtype.
     """
-    b, h, t, d = block.codes.shape
+    b, h, t, _ = block.codes.shape
+    d = block.unpacked_d
     g = d // block.group_size
-    codes = block.codes.to(dtype).reshape(b, h, t, g, block.group_size)
+    codes_unpacked = _unpack_codes(block.codes, block.bits, d)
+    codes = codes_unpacked.to(dtype).reshape(b, h, t, g, block.group_size)
     scale = block.scale.to(dtype).unsqueeze(-1)
     zero = block.zero.to(dtype).unsqueeze(-1)
     x = (codes - zero) * scale
@@ -125,19 +175,21 @@ def dequantize(block: QuantizedBlock, *, dtype: torch.dtype = torch.bfloat16) ->
 
 def concat_blocks(blocks: Tuple[QuantizedBlock, ...]) -> QuantizedBlock:
     """Concatenate quantized blocks along the token dim. All blocks must share
-    bits and group_size.
+    bits, group_size, and unpacked head_dim.
     """
     if not blocks:
         raise ValueError("concat_blocks needs at least one block")
     bits = blocks[0].bits
     group_size = blocks[0].group_size
+    unpacked_d = blocks[0].unpacked_d
     for b in blocks[1:]:
-        if b.bits != bits or b.group_size != group_size:
-            raise ValueError("blocks must share bits and group_size to concat")
+        if b.bits != bits or b.group_size != group_size or b.unpacked_d != unpacked_d:
+            raise ValueError("blocks must share bits, group_size, and unpacked_d to concat")
     return QuantizedBlock(
         codes=torch.cat([b.codes for b in blocks], dim=2),
         scale=torch.cat([b.scale for b in blocks], dim=2),
         zero=torch.cat([b.zero for b in blocks], dim=2),
         bits=bits,
         group_size=group_size,
+        unpacked_d=unpacked_d,
     )
