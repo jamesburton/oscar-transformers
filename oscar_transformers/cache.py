@@ -23,15 +23,30 @@ appended to the middle region. The sink region never changes after the first
 The cache is *not* compatible with :meth:`Cache.crop` (used by the parent
 delta-mem-tests runner for cross-question reuse). Crop is disabled for
 non-bf16 backends in ``run/_chunked_eval_runner.py``; OSCAR is no exception.
+
+Dequant shadow cache
+--------------------
+
+By default an incrementally-maintained dequantized middle is held in bf16
+alongside the packed codes (see ``_middle_k_dq`` / ``_middle_v_dq``) so
+:meth:`_assemble` does not re-dequantize the entire middle each decode step.
+At 17 k context this shadow adds ~2.45 GB persistent VRAM. Set the env var
+``OSCAR_DISABLE_DEQUANT_SHADOW=1`` to skip it — :meth:`_assemble` will
+dequantize the middle on demand each call (~40 ms/layer extra, ~24 min added
+on a conv-0/10q eval). Useful when context approaches the VRAM ceiling.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, List, Optional, Tuple
 
 import torch
 from transformers.cache_utils import Cache, CacheLayerMixin
 
 from .quantize import QuantizedBlock, concat_blocks, dequantize, quantize_per_token
+
+
+_SHADOW_DISABLED = os.environ.get("OSCAR_DISABLE_DEQUANT_SHADOW", "0") not in ("", "0", "false", "False")
 
 
 class OSCARCacheLayer(CacheLayerMixin):
@@ -161,15 +176,18 @@ class OSCARCacheLayer(CacheLayerMixin):
             # Maintain the dequantized-middle cache incrementally so :meth:`_assemble`
             # does not re-dequantize the entire INT2 middle on every decoded token.
             # Dequant cost goes from O(total_middle) per step to O(spill_size) per spill.
-            dtype = self.dtype or torch.bfloat16
-            dq_k = dequantize(quant_k, dtype=dtype)
-            dq_v = dequantize(quant_v, dtype=dtype)
-            if self._middle_k_dq is None:
-                self._middle_k_dq = dq_k
-                self._middle_v_dq = dq_v
-            else:
-                self._middle_k_dq = torch.cat([self._middle_k_dq, dq_k], dim=2)
-                self._middle_v_dq = torch.cat([self._middle_v_dq, dq_v], dim=2)
+            # Set OSCAR_DISABLE_DEQUANT_SHADOW=1 to skip this (trades ~2.45 GB at 17k
+            # for ~40 ms/layer extra per decode step).
+            if not _SHADOW_DISABLED:
+                dtype = self.dtype or torch.bfloat16
+                dq_k = dequantize(quant_k, dtype=dtype)
+                dq_v = dequantize(quant_v, dtype=dtype)
+                if self._middle_k_dq is None:
+                    self._middle_k_dq = dq_k
+                    self._middle_v_dq = dq_v
+                else:
+                    self._middle_k_dq = torch.cat([self._middle_k_dq, dq_k], dim=2)
+                    self._middle_v_dq = torch.cat([self._middle_v_dq, dq_v], dim=2)
 
         return self._assemble()
 
@@ -182,6 +200,12 @@ class OSCARCacheLayer(CacheLayerMixin):
         if self._middle_k_dq is not None:
             parts_k.append(self._middle_k_dq)
             parts_v.append(self._middle_v_dq)
+        elif self.middle_k is not None:
+            # Shadow disabled — dequantize on demand. Transient bf16 tensor lives
+            # only for this _assemble call; the subsequent torch.cat consumes it.
+            dtype = self.dtype or torch.bfloat16
+            parts_k.append(dequantize(self.middle_k, dtype=dtype))
+            parts_v.append(dequantize(self.middle_v, dtype=dtype))
         if self.recent_k is not None:
             parts_k.append(self.recent_k)
             parts_v.append(self.recent_v)

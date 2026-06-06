@@ -68,3 +68,50 @@ def test_assembled_output_token_count_matches_total() -> None:
     assert cache.get_seq_length(0) == expected
     assert out_k.shape[2] == expected
     assert out_v.shape[2] == expected
+
+
+def test_shadow_disabled_assemble_matches_enabled() -> None:
+    """With OSCAR_DISABLE_DEQUANT_SHADOW=1, _assemble should dequantize the
+    middle on demand and produce the same shape and (approximately) the same
+    values as the shadow-enabled path.
+    """
+    import os
+    import importlib
+    import oscar_transformers.cache as cache_mod
+
+    # Build a deterministic input.
+    torch.manual_seed(0)
+    head_dim, heads = 128, 8
+
+    # 1) Shadow enabled (default).
+    os.environ.pop("OSCAR_DISABLE_DEQUANT_SHADOW", None)
+    importlib.reload(cache_mod)
+    from oscar_transformers.cache import OSCARCache as OSCARCacheEnabled
+    cache_a = OSCARCacheEnabled(config=_cfg(1), sink_tokens=8, recent_tokens=16)
+    torch.manual_seed(0)
+    for n in (5, 5, 10, 30):
+        k = torch.randn(1, heads, n, head_dim, dtype=torch.bfloat16)
+        v = torch.randn(1, heads, n, head_dim, dtype=torch.bfloat16)
+        out_k_a, out_v_a = cache_a.update(k, v, 0)
+    assert cache_a.layers[0]._middle_k_dq is not None  # shadow alive
+
+    # 2) Shadow disabled.
+    os.environ["OSCAR_DISABLE_DEQUANT_SHADOW"] = "1"
+    importlib.reload(cache_mod)
+    from oscar_transformers.cache import OSCARCache as OSCARCacheDisabled
+    cache_b = OSCARCacheDisabled(config=_cfg(1), sink_tokens=8, recent_tokens=16)
+    torch.manual_seed(0)
+    for n in (5, 5, 10, 30):
+        k = torch.randn(1, heads, n, head_dim, dtype=torch.bfloat16)
+        v = torch.randn(1, heads, n, head_dim, dtype=torch.bfloat16)
+        out_k_b, out_v_b = cache_b.update(k, v, 0)
+    assert cache_b.layers[0]._middle_k_dq is None  # shadow skipped
+
+    # Same shape, same values (math is identical — both dequantize the same codes).
+    assert out_k_a.shape == out_k_b.shape
+    assert torch.allclose(out_k_a, out_k_b, atol=0, rtol=0)
+    assert torch.allclose(out_v_a, out_v_b, atol=0, rtol=0)
+
+    # Restore default for downstream tests.
+    os.environ.pop("OSCAR_DISABLE_DEQUANT_SHADOW", None)
+    importlib.reload(cache_mod)
