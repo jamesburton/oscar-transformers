@@ -161,16 +161,23 @@ def quantize_per_token(
 def dequantize(block: QuantizedBlock, *, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """Reverse of :func:`quantize_per_token`. Returns ``(B, H, T, D)`` in
     the requested floating-point dtype.
+
+    Implementation: pre-allocate the output once in ``(B, H, T, G, group_size)``
+    shape and do the affine in place — avoids the intermediate ``codes`` and
+    ``x`` bf16 tensors of the previous version (saves ~2× transient bf16
+    alloc per call vs the naive ``(codes.to(dtype) - zero) * scale``
+    expression).
     """
     b, h, t, _ = block.codes.shape
     d = block.unpacked_d
     g = d // block.group_size
     codes_unpacked = _unpack_codes(block.codes, block.bits, d)
-    codes = codes_unpacked.to(dtype).reshape(b, h, t, g, block.group_size)
-    scale = block.scale.to(dtype).unsqueeze(-1)
-    zero = block.zero.to(dtype).unsqueeze(-1)
-    x = (codes - zero) * scale
-    return x.reshape(b, h, t, d)
+    out = torch.empty(b, h, t, g, block.group_size, dtype=dtype, device=codes_unpacked.device)
+    # copy_ casts uint8 -> dtype in place (no extra bf16 alloc).
+    out.copy_(codes_unpacked.view(b, h, t, g, block.group_size))
+    out.sub_(block.zero.to(dtype).unsqueeze(-1))
+    out.mul_(block.scale.to(dtype).unsqueeze(-1))
+    return out.view(b, h, t, d)
 
 
 def concat_blocks(blocks: Tuple[QuantizedBlock, ...]) -> QuantizedBlock:

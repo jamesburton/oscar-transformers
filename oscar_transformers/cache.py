@@ -192,27 +192,67 @@ class OSCARCacheLayer(CacheLayerMixin):
         return self._assemble()
 
     def _assemble(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        parts_k: List[torch.Tensor] = []
-        parts_v: List[torch.Tensor] = []
-        if self.sink_k is not None:
-            parts_k.append(self.sink_k)
-            parts_v.append(self.sink_v)
+        """Pre-allocate output K and V once, then ``copy_`` each region into
+        its slice. Avoids ``torch.cat``'s "inputs + output alive simultaneously"
+        peak (~1 × total per arm) and lets a transient dequant tensor be
+        released between K and V instead of held simultaneously (~1 × total
+        per arm again). Net peak saving vs the prior cat-of-list approach is
+        ~2 × total per ``_assemble`` call, on top of :func:`dequantize`'s
+        own in-place affine optimisation. At 25 k context this is roughly
+        ~140 MB per layer per decode step.
+        """
+        sink_T = 0 if self.sink_k is None else self.sink_k.shape[2]
+        recent_T = 0 if self.recent_k is None else self.recent_k.shape[2]
         if self._middle_k_dq is not None:
-            parts_k.append(self._middle_k_dq)
-            parts_v.append(self._middle_v_dq)
+            middle_T = self._middle_k_dq.shape[2]
         elif self.middle_k is not None:
-            # Shadow disabled — dequantize on demand. Transient bf16 tensor lives
-            # only for this _assemble call; the subsequent torch.cat consumes it.
-            dtype = self.dtype or torch.bfloat16
-            parts_k.append(dequantize(self.middle_k, dtype=dtype))
-            parts_v.append(dequantize(self.middle_v, dtype=dtype))
-        if self.recent_k is not None:
-            parts_k.append(self.recent_k)
-            parts_v.append(self.recent_v)
-        if not parts_k:
+            middle_T = self.middle_k.codes.shape[2]
+        else:
+            middle_T = 0
+        total_T = sink_T + middle_T + recent_T
+
+        if total_T == 0:
             empty = torch.empty(0, device=self.device or "cpu")
             return empty, empty
-        return torch.cat(parts_k, dim=2), torch.cat(parts_v, dim=2)
+
+        ref = (
+            self.sink_k if self.sink_k is not None
+            else (self._middle_k_dq if self._middle_k_dq is not None else self.recent_k)
+        )
+        # ref is guaranteed non-None given total_T > 0.
+        B, H = ref.shape[0], ref.shape[1]
+        D = ref.shape[3]
+        dtype = self.dtype or torch.bfloat16
+        device = ref.device
+
+        out_k = torch.empty(B, H, total_T, D, dtype=dtype, device=device)
+        out_v = torch.empty(B, H, total_T, D, dtype=dtype, device=device)
+
+        offset = 0
+        if sink_T > 0:
+            out_k[:, :, offset:offset + sink_T, :].copy_(self.sink_k)
+            out_v[:, :, offset:offset + sink_T, :].copy_(self.sink_v)
+            offset += sink_T
+        if middle_T > 0:
+            if self._middle_k_dq is not None:
+                out_k[:, :, offset:offset + middle_T, :].copy_(self._middle_k_dq)
+                out_v[:, :, offset:offset + middle_T, :].copy_(self._middle_v_dq)
+            else:
+                # Shadow disabled — dequant K, copy to slice, free transient;
+                # then do V. The intermediate bf16 tensor for K is released
+                # before V's is created.
+                out_k[:, :, offset:offset + middle_T, :].copy_(
+                    dequantize(self.middle_k, dtype=dtype)
+                )
+                out_v[:, :, offset:offset + middle_T, :].copy_(
+                    dequantize(self.middle_v, dtype=dtype)
+                )
+            offset += middle_T
+        if recent_T > 0:
+            out_k[:, :, offset:offset + recent_T, :].copy_(self.recent_k)
+            out_v[:, :, offset:offset + recent_T, :].copy_(self.recent_v)
+
+        return out_k, out_v
 
     def snapshot(self) -> dict:
         """Capture the full layer state into a CPU-resident dict that
